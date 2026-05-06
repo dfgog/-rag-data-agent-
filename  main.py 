@@ -1,0 +1,157 @@
+import os
+import json
+import pdfplumber
+from openai import OpenAI
+from typing import List, Dict
+
+# ================= 配置区域 =================
+# 如果你使用国内中转或兼容 OpenAI 接口的模型（如 DeepSeek, Moonshot 等），请修改 base_url
+client = OpenAI(
+    api_key="sk-你的API密钥", 
+    base_url="https://api.openai.com/v1" 
+)
+
+# 模拟数据库（实际项目中这里是 PostgreSQL/MySQL/MongoDB）
+fake_database = []
+
+# ================= 工具函数 =================
+def extract_text_from_pdf(pdf_path: str) -> str:
+    """使用 pdfplumber 提取 PDF 纯文本"""
+    print(f"📄 正在读取 PDF 文件: {pdf_path}...")
+    full_text = ""
+    with pdfplumber.open(pdf_path) as pdf:
+        for i, page in enumerate(pdf.pages):
+            text = page.extract_text()
+            if text:
+                full_text += text + "\n"
+    return full_text
+
+def extract_tables_from_pdf(pdf_path: str) -> List[str]:
+    """专门提取 PDF 中的表格数据"""
+    tables = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            extracted = page.extract_tables()
+            for table in extracted:
+                # 简单转换为 CSV 格式字符串供 LLM 理解
+                table_str = "\n".join([", ".join([cell if cell else "NULL" for cell in row]) for row in table])
+                tables.append(table_str)
+    return tables
+
+# ================= 核心 Agent 逻辑 =================
+class DataProcessingAgent:
+    def __init__(self):
+        self.schema_definition = """
+        目标表名: financial_reports
+        字段要求:
+        - company_name (VARCHAR): 公司全称
+        - year (INT): 年份
+        - revenue (FLOAT): 营收金额（统一单位为百万美元）
+        - profit_margin (FLOAT): 利润率百分比
+        - risk_factors (TEXT): 主要风险点摘要（不超过50字）
+        """
+
+    def analyze_and_structure(self, raw_text: str, context_type: str) -> Dict:
+        """
+        调用 LLM 将非结构化文本转换为结构化数据
+        """
+        print(f"🧠 Agent 正在分析 {context_type} 数据并映射到 Schema...")
+        
+        system_prompt = f"""
+        你是一个专业的数据提取助手。你的任务是从提供的文本中提取关键信息，并严格遵守以下 JSON 格式输出。
+        
+        {self.schema_definition}
+        
+        输出格式要求：
+        仅输出一个标准的 JSON 对象，不要包含 markdown 格式（如 ```json），不要包含解释性文字。
+        """
+
+        user_prompt = f"""
+        请从以下文本中提取数据：
+        ---
+        {raw_text}
+        ---
+        注意：如果数值带有单位（如亿元），请换算为百万美元（假设汇率 7:1）。如果未提及某字段，填 null。
+        """
+
+        response = client.chat.completions.create(
+            model="gpt-4o", # 或者 gpt-3.5-turbo / deepseek-chat
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.1 # 低温度以保证提取稳定性
+        )
+
+        content = response.choices[0].message.content
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            print(f"⚠️ JSON 解析失败，原始内容: {content}")
+            return None
+
+    def generate_sql(self, data: Dict) -> str:
+        """模拟生成 SQL 插入语句"""
+        if not data: return ""
+        columns = ", ".join(data.keys())
+        # 简单处理字符串转义
+        values = []
+        for v in data.values():
+            if isinstance(v, str):
+                values.append(f"'{v.replace(\"'\", \"''\")}'")
+            elif v is None:
+                values.append("NULL")
+            else:
+                values.append(str(v))
+        
+        values_str = ", ".join(values)
+        sql = f"INSERT INTO financial_reports ({columns}) VALUES ({values_str});"
+        return sql
+
+    def run(self, source_text: str, source_type: str):
+        # 1. 结构化数据
+        structured_data = self.analyze_and_structure(source_text, source_type)
+        
+        if structured_data:
+            # 2. 生成入库语句
+            sql = self.generate_sql(structured_data)
+            print(f"✅ 成功提取: {structured_data.get('company_name', 'Unknown')}")
+            print(f"💾 生成 SQL: {sql}")
+            print("-" * 30)
+            
+            # 3. 模拟入库
+            fake_database.append(structured_data)
+        else:
+            print("❌ 数据处理失败")
+
+# ================= 主程序入口 =================
+def main():
+    agent = DataProcessingAgent()
+
+    # 场景 1: 处理一段非结构化的财报文本（模拟从网页或文档复制的内容）
+    raw_news_text = """
+    根据最新发布的财报，苹果公司在2023年的表现依然强劲。全年营收达到了3832.9亿美元。
+    尽管面临供应链挑战，其净利润率依然维持在25.3%的高位。
+    报告中特别提到，汇率波动和地缘政治风险是明年的主要不确定因素。
+    """
+    
+    print("\n=== 任务 1: 处理非结构化文本 ===")
+    agent.run(raw_news_text, "Text")
+
+    # 场景 2: 处理 PDF 中的表格数据（如果有本地 PDF 文件可以测试，这里用模拟数据演示逻辑）
+    # 假设 pdfplumber 提取出的表格片段如下：
+    mock_pdf_table_content = """
+    公司名称, 年度, 总营收, 净利率
+    特斯拉, 2023, 967.7亿美元, 15.5%
+    风险提示：原材料价格波动可能影响利润率。
+    """
+    
+    print("\n=== 任务 2: 处理 PDF 表格数据 ===")
+    agent.run(mock_pdf_table_content, "PDF Table")
+
+    # 打印最终数据库状态
+    print("\n=== 📊 最终入库数据概览 ===")
+    print(json.dumps(fake_database, indent=2, ensure_ascii=False))
+
+if __name__ == "__main__":
+    main()
